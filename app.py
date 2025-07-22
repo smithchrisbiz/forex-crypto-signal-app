@@ -1,39 +1,93 @@
-from flask import Flask, jsonify
+from flask import Flask
 import finnhub
 import pandas as pd
-from ta.trend import MACD
-import talib
-import time
-import pytz
-from datetime import datetime
-import threading
-import json
+import pandas_ta
 import websocket
+import json
 import requests
+from datetime import datetime, time
+import telegram
 import os
+import asyncio
+import threading
+import pytz
 
 app = Flask(__name__)
 
-# Finnhub and Telegram configuration
-api_key = "d1vhbphr01qqgeelhtj0d1vhbphr01qqgeelhtjg"  # Replace with your key or use os.getenv("FINNHUB_API_KEY")
-finnhub_client = finnhub.Client(api_key)
-TELEGRAM_TOKEN = os.getenv("7769081812:AAG1nMhPiFMvsVdmkTWr6k-p78e-Lj9atRQ")  # e.g., "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-TELEGRAM_CHAT_ID = os.getenv("1131774812")  # e.g., "123456789"
+# Environment variables
+FINNHUB_API_KEY = os.getenv('d1vhbphr01qqgeelhtj0d1vhbphr01qqgeelhtjg')
+TELEGRAM_TOKEN = os.getenv('7769081812:AAG1nMhPiFMvsVdmkTWr6k-p78e-Lj9atRQ')
+TELEGRAM_CHAT_ID = os.getenv('1131774812')
 
-# Markets (Forex and Crypto matching Olymp Trade)
-markets = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USD", "ETH/USD"]
-indicators = {market: {"rsi": 50, "macd": 0, "macd_signal": 0, "ema50": 0, "ema200": 0,
-                      "prev_rsi": 50, "prev_macd": 0, "prev_macd_signal": 0, "prev_ema50": 0, "prev_ema200": 0} for market in markets}
-prices = {market: 0 for market in markets}
 
+# Trading parameters
+SYMBOLS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'BINANCE:BTCUSDT', 'BINANCE:ETHUSDT']
+DURATIONS = ['1m', '5m', '10m', '15m']
+IST = pytz.timezone('Asia/Kolkata')
+
+# Store latest price data
+price_data = {symbol: [] for symbol in SYMBOLS}
+
+# Check if current time is within trading window (12:00 PM - 4:00 PM IST)
+def is_trading_time():
+    now = datetime.now(IST).time()
+    start_time = time(12, 0)
+    end_time = time(16, 0)
+    return start_time <= now <= end_time
+
+# Calculate indicators and generate signals
+def calculate_indicators(df):
+    df['rsi'] = pandas_ta.rsi(df['close'], length=14)
+    df['ema50'] = pandas_ta.ema(df['close'], length=50)
+    df['ema200'] = pandas_ta.ema(df['close'], length=200)
+    df['macd'] = pandas_ta.macd(df['close'], fast=12, slow=26, signal=9)['MACD_12_26_9']
+    df['macd_signal'] = pandas_ta.macd(df['close'], fast=12, slow=26, signal=9)['MACDs_12_26_9']
+    return df
+
+def generate_signal(symbol, df):
+    if len(df) < 200:  # Ensure enough data for EMA200
+        return None
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    # Signal logic: RSI overbought/oversold + MACD crossover + EMA alignment
+    if (latest['rsi'] > 70 and latest['macd'] < latest['macd_signal'] and prev['macd'] >= prev['macd_signal'] and
+        latest['ema50'] < latest['ema200']):
+        reason = "RSI overbought + MACD bearish crossover + EMA50 below EMA200"
+        return {'direction': 'down', 'reason': reason, 'duration': '5m', 'price': latest['close']}
+    elif (latest['rsi'] < 30 and latest['macd'] > latest['macd_signal'] and prev['macd'] <= prev['macd_signal'] and
+          latest['ema50'] > latest['ema200']):
+        reason = "RSI oversold + MACD bullish crossover + EMA50 above EMA200"
+        return {'direction': 'up', 'reason': reason, 'duration': '5m', 'price': latest['close']}
+    return None
+
+# Send signal to Telegram
+async def send_telegram_message(message):
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+
+# WebSocket handler
 def on_message(ws, message):
+    if not is_trading_time():
+        return
     data = json.loads(message)
     if 'data' in data:
-        for quote in data['data']:
-            market = quote['s']
-            if market in ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTCUSD", "ETHUSD"]:
-                mapped_market = {"EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "USDJPY=X": "USD/JPY"}.get(market, market)
-                prices[mapped_market] = quote['p']
+        for tick in data['data']:
+            symbol = tick['s']
+            price = tick['p']
+            timestamp = datetime.fromtimestamp(tick['t'] / 1000, tz=IST)
+            price_data[symbol].append({'time': timestamp, 'close': price})
+            # Keep only last 300 data points to avoid memory issues
+            if len(price_data[symbol]) > 300:
+                price_data[symbol] = price_data[symbol][-300:]
+            # Convert to DataFrame and calculate indicators
+            df = pd.DataFrame(price_data[symbol])
+            df = calculate_indicators(df)
+            signal = generate_signal(symbol, df)
+            if signal:
+                message = (f"Make {signal['direction']} on {symbol} at {timestamp.strftime('%H:%M:%S %Z')}, "
+                          f"Reason: {signal['reason']}, Trade for: {signal['duration']}, "
+                          f"Current Price: {signal['price']}")
+                asyncio.run(send_telegram_message(message))
 
 def on_error(ws, error):
     print(f"WebSocket error: {error}")
@@ -42,11 +96,13 @@ def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed")
 
 def on_open(ws):
-    ws.send(json.dumps({"type": "subscribe", "symbol": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTCUSD", "ETHUSD"]}))
+    for symbol in SYMBOLS:
+        ws.send(json.dumps({'type': 'subscribe', 'symbol': symbol}))
 
+# Start WebSocket in a separate thread
 def start_websocket():
     ws = websocket.WebSocketApp(
-        f"wss://ws.finnhub.io?token={api_key}",
+        f"wss://ws.finnhub.io?token={FINNHUB_API_KEY}",
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
@@ -54,77 +110,12 @@ def start_websocket():
     )
     ws.run_forever()
 
-def calculate_indicators():
-    while True:
-        ist = pytz.timezone("Asia/Kolkata")
-        current_time = datetime.now(ist)
-        if current_time.hour >= 0 and current_time.hour < 23:
-            for market in markets:
-                current_price = prices[market]
-                if current_price:
-                    df = pd.DataFrame([{"close": current_price}])
-                    rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1] if len(df) >= 14 else indicators[market]["rsi"]
-                    macd = MACD(df['close']).macd()[-1] if len(df) >= 26 else indicators[market]["macd"]
-                    macd_signal = MACD(df['close']).macd_signal()[-1] if len(df) >= 26 else indicators[market]["macd_signal"]
-                    ema50 = talib.EMA(df['close'], timeperiod=50).iloc[-1] if len(df) >= 50 else indicators[market]["ema50"]
-                    ema200 = talib.EMA(df['close'], timeperiod=200).iloc[-1] if len(df) >= 200 else indicators[market]["ema200"]
-                    prev_rsi = indicators[market]["rsi"]
-                    prev_macd = indicators[market]["macd"]
-                    prev_macd_signal = indicators[market]["macd_signal"]
-                    prev_ema50 = indicators[market]["ema50"]
-                    prev_ema200 = indicators[market]["ema200"]
-                    indicators[market] = {"rsi": rsi, "macd": macd, "macd_signal": macd_signal, "ema50": ema50, "ema200": ema200,
-                                        "prev_rsi": prev_rsi, "prev_macd": prev_macd, "prev_macd_signal": prev_macd_signal,
-                                        "prev_ema50": prev_ema50, "prev_ema200": prev_ema200}
-                    rsi_change = abs(rsi - prev_rsi) if rsi and prev_rsi else 0
-                    macd_change = abs(macd - prev_macd) if macd and prev_macd else 0
-                    ema_change = abs(ema50 - prev_ema50) if ema50 and prev_ema50 else 0
-                    if (rsi < 30 or ema50 > ema200) and macd > macd_signal and prev_macd <= prev_macd_signal:
-                        signal_type = "up"
-                        reason = f"Oversold RSI ({rsi:.1f}) or EMA50 > EMA200 with bullish MACD crossover"
-                        if rsi_change > 5 or macd_change > 1 or ema_change > 0.5:
-                            duration = "1m"
-                        elif rsi_change > 3 or macd_change > 0.5 or ema_change > 0.3:
-                            duration = "5m"
-                        elif rsi_change > 2 or macd_change > 0.3 or ema_change > 0.2:
-                            duration = "10m"
-                        else:
-                            duration = "15m"
-                        send_telegram_signal(market, signal_type, reason, duration, current_time, current_price)
-                    elif (rsi > 70 or ema50 < ema200) and macd < macd_signal and prev_macd >= prev_macd_signal:
-                        signal_type = "down"
-                        reason = f"Overbought RSI ({rsi:.1f}) or EMA50 < EMA200 with bearish MACD crossover"
-                        if rsi_change > 5 or macd_change > 1 or ema_change > 0.5:
-                            duration = "1m"
-                        elif rsi_change > 3 or macd_change > 0.5 or ema_change > 0.3:
-                            duration = "5m"
-                        elif rsi_change > 2 or macd_change > 0.3 or ema_change > 0.2:
-                            duration = "10m"
-                        else:
-                            duration = "15m"
-                        send_telegram_signal(market, signal_type, reason, duration, current_time, current_price)
-        time.sleep(1)
-
-def send_telegram_signal(market, signal_type, reason, duration, current_time, current_price):
-    message = f"Make {signal_type} on {market} at {current_time.strftime('%Y-%m-%d %H:%M:%S')}\nReason: {reason}\nTrade for: {duration}\nCurrent Price: {current_price:.2f}"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Telegram error: {e}")
-
-# Start WebSocket and indicator loop in separate threads
-threading.Thread(target=start_websocket, daemon=True).start()
-threading.Thread(target=calculate_indicators, daemon=True).start()
-
 @app.route('/')
-def home():
-    return "Forex & Crypto Signal App Online"
+def index():
+    return "Forex/Crypto Signal App is running!"
 
-@app.route('/signal')
-def get_signal():
-    return jsonify({"status": "Running", "check_interval": "1 second"})
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == '__main__':
+    # Start WebSocket in a background thread
+    threading.Thread(target=start_websocket, daemon=True).start()
+    # Run Flask app
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
