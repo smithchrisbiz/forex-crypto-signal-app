@@ -12,6 +12,7 @@ import asyncio
 import threading
 import pytz
 
+
 app = Flask(__name__)
 
 # Environment variables
@@ -71,8 +72,8 @@ def on_message(ws, message):
         return
     data = json.loads(message)
     if 'data' in data:
-        for tick in data['data']:
-            symbol = tick['s']
+        for tick in data['data']]:
+            symbol = tic['s']
             price = tick['p']
             timestamp = datetime.fromtimestamp(tick['t'] / 1000, tz=IST)
             price_data[symbol].append({'time': timestamp, 'close': price})
@@ -115,7 +116,7 @@ def index():
     return "Forex/Crypto Signal App is running!"
 
 if __name__ == '__main__':
-    # Start WebSocket in a background thread
+    # Start WebSocket in a background thread smackground thread
     threading.Thread(target=start_websocket, daemon=True).start()
     # Run Flask app
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
