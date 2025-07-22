@@ -32,8 +32,8 @@ price_data = {symbol: [] for symbol in SYMBOLS}
 # Check if current time is within trading window (12:00 PM - 4:00 PM IST)
 def is_trading_time():
     now = datetime.now(IST).time()
-    start_time = time(12, 0)
-    end_time = time(16, 0)
+    start_time = time(1, 0)
+    end_time = time(23, 0)
     return start_time <= now <= end_time
 
 # Calculate indicators and generate signals
@@ -72,8 +72,8 @@ def on_message(ws, message):
         return
     data = json.loads(message)
     if 'data' in data:
-        for tick in data['data']]:
-            symbol = tic['s']
+        for tick in data['data']:
+            symbol = tick['s']
             price = tick['p']
             timestamp = datetime.fromtimestamp(tick['t'] / 1000, tz=IST)
             price_data[symbol].append({'time': timestamp, 'close': price})
@@ -116,7 +116,7 @@ def index():
     return "Forex/Crypto Signal App is running!"
 
 if __name__ == '__main__':
-    # Start WebSocket in a background thread smackground thread
+    # Start WebSocket in a background thread
     threading.Thread(target=start_websocket, daemon=True).start()
     # Run Flask app
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
