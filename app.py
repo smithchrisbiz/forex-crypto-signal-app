@@ -12,7 +12,6 @@ import asyncio
 import threading
 import pytz
 
-
 app = Flask(__name__)
 
 # Environment variables
